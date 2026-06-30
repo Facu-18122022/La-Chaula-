@@ -204,6 +204,42 @@ function getMapConfig(index) {
     return maps[index] || maps[0];
 }
 
+function resetRoomPositions(room) {
+    if (!room || !room.game) return;
+    const map = room.game.map || getMapConfig(room.selectedMapIndex);
+    const midX = map.width / 2;
+    const midY = map.height / 2;
+    const padding = 30;
+    const minX = 20 + padding;
+    const maxX = map.width - 20 - padding;
+    const minY = 20 + padding;
+    const maxY = map.height - 20 - padding;
+
+    room.game.players.forEach(player => {
+        player.vx = 0;
+        player.vy = 0;
+        player.x = player.team === 'blue' ? Math.max(minX, midX - 150) : Math.min(maxX, midX + 150);
+        player.y = Math.max(minY, Math.min(maxY, midY));
+        player.activePower = null;
+        player.powerTimer = 0;
+    });
+
+    room.game.ball.x = midX;
+    room.game.ball.y = midY;
+    room.game.ball.vx = 0;
+    room.game.ball.vy = 0;
+    room.game.inputStates = {};
+    room.game.lastTouch = null;
+    room.game.secondLastTouch = null;
+    room.game.activePowerUps = [];
+    room.game.powerUpSpawnTimer = 0;
+    room.game.timerStarted = false;
+    room.game.waitingForKickOff = true;
+    room.game.kickOffTeam = 'red';
+    room.game.restrictMidForRed = true;
+    room.game.kickoffGraceUntil = 0;
+}
+
 function createRoomGameState(room) {
     const map = getMapConfig(room.selectedMapIndex);
     const fieldLeft = 80;
@@ -221,13 +257,14 @@ function createRoomGameState(room) {
         vy: 0,
         r: 20,
         massa: 2.0,
-        activePower: null
+        activePower: null,
+        powerTimer: 0
     }));
 
     const goalTop = (map.height / 2) - (map.goalHeight / 2);
     const goalBottom = (map.height / 2) + (map.goalHeight / 2);
 
-    return {
+    const gameState = {
         active: true,
         lastTick: Date.now(),
         map,
@@ -240,7 +277,12 @@ function createRoomGameState(room) {
         activePowerUps: [],
         powerUpSpawnTimer: 0,
         timerStarted: false,
+        paused: false,
+        celebrationActive: false,
+        waitingForKickOff: true,
+        kickOffTeam: 'red',
         restrictMidForRed: true,
+        kickoffGraceUntil: 0,
         lastTouch: null,
         secondLastTouch: null,
         ball: {
@@ -257,6 +299,9 @@ function createRoomGameState(room) {
         remainingMs: (room.matchTime || 5) * 60 * 1000,
         intervalId: null
     };
+
+    resetRoomPositions({ game: gameState, selectedMapIndex: room.selectedMapIndex });
+    return gameState;
 }
 
 function stopRoomGameLoop(room) {
@@ -293,8 +338,17 @@ function broadcastRoomGameState(room) {
         scores: room.game.scores,
         remainingMs: room.game.remainingMs,
         timerStarted: !!room.game.timerStarted,
+        paused: !!room.game.paused,
+        celebrationActive: !!room.game.celebrationActive,
+        waitingForKickOff: !!room.game.waitingForKickOff,
+        kickOffTeam: room.game.kickOffTeam || 'red',
         restrictMidForRed: !!room.game.restrictMidForRed
     });
+}
+
+function getPlayerInputState(room, player) {
+    if (!room || !room.game || !player) return {};
+    return room.game.inputStates[player.id] || room.game.inputStates[player.nickname] || {};
 }
 
 function processRoomGameTick(room) {
@@ -304,6 +358,11 @@ function processRoomGameTick(room) {
     room.game.lastTick = now;
     const step = Math.min(deltaMs / 16.666, 2);
 
+    if (room.game.paused || room.game.celebrationActive) {
+        broadcastRoomGameState(room);
+        return;
+    }
+
     const ACCEL = 0.25;
     const MAX_VEL = 3.4;
     const FRICTION = 0.93;
@@ -311,7 +370,7 @@ function processRoomGameTick(room) {
     const RESTITUTION = -0.55;
 
     room.game.players.forEach(player => {
-        const input = room.game.inputStates[player.nickname] || {};
+        const input = getPlayerInputState(room, player);
         let moveX = 0;
         let moveY = 0;
 
@@ -336,12 +395,45 @@ function processRoomGameTick(room) {
 
         player.vx *= FRICTION;
         player.vy *= FRICTION;
-        player.x += player.vx * step;
-        player.y += player.vy * step;
 
         const r = player.r;
-        player.x = Math.max(r, Math.min(room.game.map.width - r, player.x));
-        player.y = Math.max(r, Math.min(room.game.map.height - r, player.y));
+        const minX = r;
+        const maxX = room.game.map.width - r;
+        const minY = r;
+        const maxY = room.game.map.height - r;
+
+        if (room.game.waitingForKickOff && player.team !== room.game.kickOffTeam) {
+            const side = player.team === 'blue' ? -1 : 1;
+            const centerX = room.game.map.width / 2;
+            const boundaryX = centerX + (side > 0 ? 1 : -1) * (r + 4);
+            const isCrossing = (side > 0 && player.x < boundaryX) || (side < 0 && player.x > boundaryX);
+            if (isCrossing) {
+                player.x = boundaryX;
+                player.vx = 0;
+            }
+        }
+
+        let nextX = player.x + player.vx * step;
+        let nextY = player.y + player.vy * step;
+
+        if (nextX < minX) {
+            nextX = minX;
+            player.vx = 0;
+        } else if (nextX > maxX) {
+            nextX = maxX;
+            player.vx = 0;
+        }
+
+        if (nextY < minY) {
+            nextY = minY;
+            player.vy = 0;
+        } else if (nextY > maxY) {
+            nextY = maxY;
+            player.vy = 0;
+        }
+
+        player.x = nextX;
+        player.y = nextY;
     });
 
     const ball = room.game.ball;
@@ -365,34 +457,43 @@ function processRoomGameTick(room) {
         const dist = Math.sqrt(dx * dx + dy * dy) || 1;
         const minDist = player.r + ball.r;
         if (dist < minDist) {
+            if (room.game.waitingForKickOff && player.team !== room.game.kickOffTeam) {
+                ball.vx = 0;
+                ball.vy = 0;
+                return;
+            }
+
             const angle = Math.atan2(dy, dx);
             const overlap = minDist - dist;
-            ball.x += Math.cos(angle) * overlap;
-            ball.y += Math.sin(angle) * overlap;
+            const pushOut = Math.max(0, overlap + 1.5);
+            ball.x += Math.cos(angle) * pushOut;
+            ball.y += Math.sin(angle) * pushOut;
 
-            const input = room.game.inputStates[player.nickname] || {};
+            const input = getPlayerInputState(room, player);
             const isKicking = !!input.kick;
+            const shouldStartTimer = !room.game.timerStarted && (!room.game.waitingForKickOff || player.team === room.game.kickOffTeam);
 
-            // Update last touch info
-            room.game.secondLastTouch = room.game.lastTouch || null;
-            room.game.lastTouch = player.nickname || room.game.lastTouch;
+            if (shouldStartTimer) {
+                room.game.timerStarted = true;
+                room.game.waitingForKickOff = false;
+                room.game.restrictMidForRed = false;
+                room.game.kickoffGraceUntil = Date.now() + 400;
+            }
 
-            // Start timer on first touch
-            if (!room.game.timerStarted) room.game.timerStarted = true;
-
-            // If blue touches, lift mid restriction
-            if (player.team === 'blue') room.game.restrictMidForRed = false;
+            if (room.game.timerStarted) {
+                room.game.secondLastTouch = room.game.lastTouch || null;
+                room.game.lastTouch = player.nickname || room.game.lastTouch;
+            }
 
             const baseSpeed = Math.sqrt(player.vx * player.vx + player.vy * player.vy);
 
             if (isKicking) {
-                const force = (player.activePower === 'SUPER_KICK') ? Math.max(10, baseSpeed * 2.0) : Math.max(6, baseSpeed * 1.6);
-                ball.vx = Math.cos(angle) * force + (player.vx * 0.5);
-                ball.vy = Math.sin(angle) * force + (player.vy * 0.5);
+                const force = (player.activePower === 'SUPER_KICK') ? Math.max(10.5, baseSpeed * 2.2) : Math.max(7.2, baseSpeed * 1.7);
+                ball.vx = Math.cos(angle) * force + (player.vx * 0.35);
+                ball.vy = Math.sin(angle) * force + (player.vy * 0.35);
             } else {
-                // Small influence when dribbling / moving near the ball
-                ball.vx += player.vx * 0.22;
-                ball.vy += player.vy * 0.22;
+                ball.vx += player.vx * 0.18;
+                ball.vy += player.vy * 0.18;
             }
         }
     });
@@ -434,35 +535,56 @@ function processRoomGameTick(room) {
         }
     }
 
-    const insideLeftGoal = ball.x - ball.r < room.game.field.left && ball.y - ball.r >= room.game.goalTop && ball.y + ball.r <= room.game.goalBottom;
-    const insideRightGoal = ball.x + ball.r > room.game.field.right && ball.y - ball.r >= room.game.goalTop && ball.y + ball.r <= room.game.goalBottom;
+    const canScore = room.game.timerStarted && !room.game.waitingForKickOff && Date.now() >= (room.game.kickoffGraceUntil || 0);
+    const insideLeftGoal = canScore && ball.x - ball.r < room.game.field.left && ball.y - ball.r >= room.game.goalTop && ball.y + ball.r <= room.game.goalBottom;
+    const insideRightGoal = canScore && ball.x + ball.r > room.game.field.right && ball.y - ball.r >= room.game.goalTop && ball.y + ball.r <= room.game.goalBottom;
 
     if (insideLeftGoal) {
         room.game.scores.red += 1;
+        room.game.paused = true;
+        room.game.celebrationActive = true;
+        room.game.timerStarted = false;
+        room.game.waitingForKickOff = true;
+        room.game.kickOffTeam = 'blue';
+        room.game.ball.vx = 0;
+        room.game.ball.vy = 0;
         const scorer = room.game.lastTouch || 'Jugador';
         io.to(room.id).emit('game:goal', {
             scorer: scorer,
             team: 'red',
             roomId: room.id
         });
-        ball.x = room.game.map.width / 2;
-        ball.y = room.game.map.height / 2;
-        ball.vx = 0;
-        ball.vy = 0;
+        resetRoomPositions(room);
+        room.game.paused = true;
+        room.game.celebrationActive = true;
+        room.game.timerStarted = false;
+        room.game.waitingForKickOff = true;
+        room.game.kickOffTeam = 'blue';
         room.game.restrictMidForRed = true;
+        room.game.kickoffGraceUntil = Date.now() + 400;
     } else if (insideRightGoal) {
         room.game.scores.blue += 1;
+        room.game.paused = true;
+        room.game.celebrationActive = true;
+        room.game.timerStarted = false;
+        room.game.waitingForKickOff = true;
+        room.game.kickOffTeam = 'red';
+        room.game.ball.vx = 0;
+        room.game.ball.vy = 0;
         const scorer = room.game.lastTouch || 'Jugador';
         io.to(room.id).emit('game:goal', {
             scorer: scorer,
             team: 'blue',
             roomId: room.id
         });
-        ball.x = room.game.map.width / 2;
-        ball.y = room.game.map.height / 2;
-        ball.vx = 0;
-        ball.vy = 0;
+        resetRoomPositions(room);
+        room.game.paused = true;
+        room.game.celebrationActive = true;
+        room.game.timerStarted = false;
+        room.game.waitingForKickOff = true;
+        room.game.kickOffTeam = 'red';
         room.game.restrictMidForRed = true;
+        room.game.kickoffGraceUntil = Date.now() + 400;
     } else {
         if (ball.x - ball.r < room.game.field.left) {
             ball.x = room.game.field.left + ball.r;
@@ -474,7 +596,9 @@ function processRoomGameTick(room) {
         }
     }
 
-    room.game.remainingMs = Math.max(0, room.game.remainingMs - deltaMs);
+    if (room.game.timerStarted) {
+        room.game.remainingMs = Math.max(0, room.game.remainingMs - deltaMs);
+    }
 
     if (room.game.remainingMs <= 0) {
         room.matchActive = false;
@@ -493,7 +617,7 @@ function processRoomGameTick(room) {
 function startRoomGameLoop(room) {
     if (!room || !room.game || room.game.intervalId) return;
     room.game.lastTick = Date.now();
-    room.game.intervalId = setInterval(() => processRoomGameTick(room), 50);
+    room.game.intervalId = setInterval(() => processRoomGameTick(room), 16);
 }
 
 // ========================= //
@@ -863,19 +987,44 @@ io.on("connection", (socket) => {
     });
 
     socket.on('game:input', (data) => {
-        if (!data || !data.roomId || !data.nickname || !data.input) return;
+        if (!data || !data.roomId || !data.input) return;
         const roomId = String(data.roomId || '').trim();
         const room = getRoomInfo(roomId);
         if (!room || !room.game) return;
 
-        const nickname = String(data.nickname || '').trim();
-        room.game.inputStates[nickname] = {
+        const player = room.players.find(p => p.id === socket.id || (p.nickname && p.nickname.trim().toLowerCase() === String(data.nickname || '').trim().toLowerCase()));
+        if (!player) return;
+
+        const inputState = {
             up: !!data.input.up,
             down: !!data.input.down,
             left: !!data.input.left,
             right: !!data.input.right,
             kick: !!data.input.kick
         };
+
+        room.game.inputStates[socket.id] = inputState;
+        room.game.inputStates[player.id] = inputState;
+        room.game.inputStates[player.nickname] = inputState;
+    });
+
+    socket.on('game:pause', (data) => {
+        const roomId = String(data?.roomId || '').trim();
+        const room = getRoomInfo(roomId);
+        if (!room || !room.game) return;
+        room.game.paused = true;
+        room.game.celebrationActive = true;
+        broadcastRoomGameState(room);
+    });
+
+    socket.on('game:resume', (data) => {
+        const roomId = String(data?.roomId || '').trim();
+        const room = getRoomInfo(roomId);
+        if (!room || !room.game) return;
+        room.game.paused = false;
+        room.game.celebrationActive = false;
+        room.game.lastTick = Date.now();
+        broadcastRoomGameState(room);
     });
 
     // ========================= //
@@ -910,6 +1059,10 @@ io.on("connection", (socket) => {
         room.matchActive = true;
         room.game = createRoomGameState(room);
         room.emptySince = null;
+        room.game.paused = false;
+        room.game.celebrationActive = false;
+        room.game.waitingForKickOff = true;
+        room.game.kickOffTeam = 'red';
         io.to(roomId).emit("match:started", {
             roomId,
             matchTime: room.matchTime,
@@ -917,6 +1070,34 @@ io.on("connection", (socket) => {
             selectedMapIndex: room.selectedMapIndex,
             players: room.players.map(p => ({ nickname: p.nickname, team: p.team })),
             settings: room.settings
+        });
+
+        io.to(roomId).emit('game:state', {
+            roomId: room.id,
+            players: room.game.players.map(p => ({
+                nickname: p.nickname,
+                team: p.team,
+                x: p.x,
+                y: p.y,
+                vx: p.vx,
+                vy: p.vy,
+                r: p.r
+            })),
+            ball: {
+                x: room.game.ball.x,
+                y: room.game.ball.y,
+                vx: room.game.ball.vx,
+                vy: room.game.ball.vy,
+                r: room.game.ball.r
+            },
+            scores: room.game.scores,
+            remainingMs: room.game.remainingMs,
+            timerStarted: !!room.game.timerStarted,
+            paused: !!room.game.paused,
+            celebrationActive: !!room.game.celebrationActive,
+            waitingForKickOff: !!room.game.waitingForKickOff,
+            kickOffTeam: room.game.kickOffTeam || 'red',
+            restrictMidForRed: !!room.game.restrictMidForRed
         });
 
         startRoomGameLoop(room);
